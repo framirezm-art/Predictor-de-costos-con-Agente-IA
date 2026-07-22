@@ -1,0 +1,20 @@
+{
+  "Price_Y": {
+    "es_estacionaria_en_nivel": false,
+    "volatilidad": {
+      "serie": "Price_Y",
+      "std_retornos_hist_%": 1.041,
+      "std_retornos_reciente_%": 1.049,
+      "ratio_reciente/hist": 1.01
+    }
+  },
+  "Price_Z": {
+    "es_estacionaria_en_nivel": false,
+    "volatilidad": {
+      "serie": "Price_Z",
+      "std_retornos_hist_%": 1.368,
+      "std_retornos_reciente_%": 1.279,
+      "ratio_reciente/hist": 0.93
+    }
+  }
+}

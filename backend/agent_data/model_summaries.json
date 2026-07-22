@@ -1,0 +1,36 @@
+{
+  "Equipo1": {
+    "features": [
+      "Price_Y"
+    ],
+    "coeficientes": {
+      "Price_Y": 0.8181625847641856
+    },
+    "intercepto": 5.5304929863798975,
+    "r2_in_sample": 0.9932479648169428,
+    "validacion_walk_forward": {
+      "MAE": 7.92,
+      "RMSE": 9.05,
+      "MAPE_%": 1.72
+    },
+    "horizonte_dias": 40
+  },
+  "Equipo2": {
+    "features": [
+      "Price_Y",
+      "Price_Z"
+    ],
+    "coeficientes": {
+      "Price_Y": 0.3555034605328033,
+      "Price_Z": 0.3364613983990161
+    },
+    "intercepto": 6.9628666445477165,
+    "r2_in_sample": 0.9897127195662356,
+    "validacion_walk_forward": {
+      "MAE": 13.69,
+      "RMSE": 16.07,
+      "MAPE_%": 1.48
+    },
+    "horizonte_dias": 40
+  }
+}
