@@ -1,171 +1,321 @@
-# Cost Forecast Agent
+# Cost Forecast Agent — Documentación Técnica
 
-Aplicación full-stack para explorar el pronóstico de costos de equipos de
-construcción: modelos ARIMA + regresión + Monte Carlo, expuestos a través de
-un agente conversacional (LangGraph + DeepSeek vía NVIDIA API) y de una API
-REST tradicional, con un frontend React para dashboard, gráficos y chat.
+> Prueba técnica: agente conversacional (LangGraph + DeepSeek vía NVIDIA API) sobre
+> modelos de pronóstico de costos de equipos, expuesto vía API REST (FastAPI) y
+> consumido por un frontend React, con arquitectura preparada para despliegue en Azure.
 
-## Arquitectura
+
+---
+
+## 1. Resumen del proyecto
+
+| | |
+|---|---|
+| **Backend** | FastAPI (Python 3.11), Clean Architecture, expone el agente LangGraph + endpoints de pronóstico/histórico como API REST |
+| **Frontend** | React 18 + Vite, consumo vía Axios, gráficos con Recharts |
+| **Agente de IA** | LangGraph (`create_react_agent`) + DeepSeek-V4-Flash vía API de NVIDIA, con memoria de conversación (encontrada gratis en la web)(`MemorySaver`) |
+| **Contenedores** | Docker multi-stage para backend y frontend, con `docker-compose` |
+| **CI/CD** | GitHub Actions: build + push a Azure Container Registry + deploy a Azure App Service (backend); build + deploy a Azure Static Web Apps (frontend) |
+| **Estado de ejecución local** | ✅ Verificado (Dashboard, Forecast, Chat) |
+| **Estado de despliegue en Azure** | ⚠️ Pipeline configurado y probado hasta el paso de despliegue; bloqueado por cuota de la suscripción de estudiante (sección 5) |
+
+---
+
+## 2. Arquitectura de software (backend)
+
+El backend sigue **Clean Architecture**: las dependencias apuntan siempre hacia
+adentro (hacia el dominio), nunca al revés.
 
 ```
-.
-├── backend/                     # FastAPI (Clean Architecture)
-│   ├── app/
-│   │   ├── main.py              # Entry point, wiring de middlewares/routers
-│   │   ├── core/                # Configuración (settings vía env vars)
-│   │   ├── domain/               # Entidades puras, sin dependencias externas
-│   │   ├── application/          # Casos de uso (services) — lógica de negocio
-│   │   ├── infrastructure/       # Detalles técnicos: agente LangGraph, repos JSON/CSV
-│   │   ├── api/                  # Capa HTTP: routers + schemas Pydantic + DI
-│   │   └── exceptions/           # Excepciones de dominio + manejo centralizado
-│   ├── agent_data/               # JSON/CSV exportados por el notebook (sección 6)
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/                     # React + Vite
-│   ├── src/
-│   │   ├── api/                  # Cliente Axios centralizado + servicios por dominio
-│   │   ├── hooks/                 # useForecast, useChat (loading/error uniforme)
-│   │   ├── components/            # common/, dashboard/, forecast/, chat/
-│   │   ├── pages/                 # Dashboard, Forecast, Chat
-│   │   └── routes/                # React Router
-│   ├── Dockerfile                 # multi-stage build + nginx
-│   └── staticwebapp.config.json   # routing SPA para Azure Static Web Apps
-├── .github/workflows/             # CI/CD para Azure (backend + frontend)
-└── docker-compose.yml
+backend/app/
+├── domain/            # Entidades puras (dataclasses), sin dependencias externas
+├── application/        # Casos de uso: orquestan domain + infrastructure
+│   └── services/        (ForecastService, HistoricoService, ChatService)
+├── infrastructure/      # Detalles técnicos, reemplazables sin tocar el resto
+│   ├── agent/            → agente LangGraph (agent_langgraph.py, agent_runtime.py)
+│   └── repositories/     → acceso a los JSON/CSV exportados por el notebook
+├── api/                # Capa HTTP: traduce REST <-> casos de uso
+│   ├── v1/routers/       (chat, forecast, models, historico, health)
+│   ├── v1/schemas/       (Pydantic: validación/serialización)
+│   └── deps.py           (inyección de dependencias)
+├── exceptions/          # Excepciones de dominio + manejo centralizado de errores
+└── main.py              # Entry point (FastAPI app, middlewares, wiring)
 ```
 
-### Por qué esta separación
+Permite que el agente de IA, los modelos de
+pronóstico y el mecanismo de lectura de datos (hoy JSON/CSV) se puedan
+reemplazar — por ejemplo, migrar a una base de datos o a Azure Blob Storage —
+sin tocar la lógica de negocio (`application/`) ni los endpoints (`api/`).
 
-- **`domain/`** no importa nada de FastAPI ni de librerías externas: son las
-  reglas de negocio (qué es un `ModelSummary`, un `ChatReply`) que sobreviven
-  a cualquier cambio de framework.
-- **`application/`** orquesta casos de uso (p.ej. "responder un mensaje del
-  chat") usando abstracciones de `domain/`, sin saber si los datos vienen de
-  un JSON, una base de datos o una API externa.
-- **`infrastructure/`** es donde vive el detalle técnico: cómo se lee el
-  `historico_equipos.csv`, cómo se construye el grafo de LangGraph, qué
-  modelo LLM se usa. Se puede reemplazar sin tocar `application/`.
-- **`api/`** es la capa más externa: solo traduce HTTP <-> casos de uso.
+### El agente conversacional
 
-## El agente conversacional
+# Arquitectura del agente de IA
 
-`app/infrastructure/agent/agent_langgraph.py` es una copia casi literal de tu
-`agent_langgraph.py` original. Las **modificaciones**, documentadas también en
-el propio archivo, fueron:
+El agente fue desarrollado utilizando **LangGraph** bajo el paradigma **ReAct (Reasoning + Acting)**.
 
-1. Rutas de datos vía `app.core.config` (antes relativas al cwd).
-2. `NVIDIA_API_KEY` leída de variable de entorno (antes hardcodeada).
-3. Se eliminó el bucle `run_agent()` a nivel de módulo (si no, se dispararía
-   un `input()` al importar el archivo desde FastAPI).
-4. La tool `web_search` ya no usa `DuckDuckGoSearchRun` de `langchain_community`
-   (paquete anunciado como "sunset" por el equipo de LangChain, y que además
-   generaba conflictos de versión con `langgraph`/`langchain-openai` recientes).
-   Se reemplazó por una tool propia que llama directo a `duckduckgo-search`,
-   con el mismo nombre, misma descripción y mismo tipo de resultado — el
-   agente la usa exactamente igual, solo cambió la implementación interna.
+Su funcionamiento consiste en un ciclo iterativo donde el modelo:
 
-Las tools de negocio (`get_equipo_forecast`, `get_model_info`,
-`get_historical_price`, `get_raw_material_forecast`), el prompt del sistema,
-el grafo (`create_react_agent`) y el checkpointer de memoria **no se
-tocaron**.
+1. Analiza la consulta del usuario.
+2. Decide qué herramienta necesita utilizar.
+3. Obtiene información real desde dicha herramienta.
+4. Razona sobre los resultados obtenidos.
+5. Construye una respuesta fundamentada.
 
-## Requisitos
+Adicionalmente, el agente incorpora memoria conversacional, lo que le permite conservar el contexto entre diferentes preguntas y ofrecer respuestas más naturales durante una misma conversación.
 
-- Docker + Docker Compose
-- (Para desarrollo local sin Docker) Python 3.11 y Node.js 20 LTS
-- Una API key de NVIDIA (`NVIDIA_API_KEY`) para el modelo DeepSeek
+## Arquitectura del sistema
 
-## Ejecutar con Docker Compose (recomendado)
+```mermaid
+flowchart LR
+    U["Usuario"] --> API["API FastAPI"]
+    API --> S["Servicios de aplicación"]
+    S --> R["Runtime del agente"]
+    R --> A["LangGraph / ReAct"]
+    A --> LLM["ChatOpenAI (NVIDIA/DeepSeek)"]
+
+    A --> T1["get_equipo_forecast()"]
+    A --> T2["get_model_info()"]
+    A --> T3["get_historical_price()"]
+    A --> T4["get_raw_material_forecast()"]
+    A --> T5["web_search()"]
+
+    T1 --> D1["Forecasts JSON"]
+    T2 --> D2["Model summaries"]
+    T3 --> D3["Histórico JSON/CSV"]
+    T4 --> D4["Raw forecasts"]
+    T5 --> D5["Web / DuckDuckGo"]
+
+    D1 --> A
+    D2 --> A
+    D3 --> A
+    D4 --> A
+    D5 --> A
+
+    A --> O["Respuesta al usuario"]
+    O --> API
+```
+
+---
+
+# Herramientas disponibles
+
+## 1. Pronóstico de precios de equipos
+
+Permite consultar el pronóstico generado por el pipeline de predicción para cualquier fecha disponible del horizonte proyectado.
+
+La información recuperada incluye:
+
+* percentil 5;
+* mediana;
+* percentil 95.
+
+El agente comunica la incertidumbre asociada a cada predicción mediante intervalos probabilísticos.
+
+---
+
+## 2. Información del modelo predictivo
+
+Esta herramienta proporciona información sobre el modelo utilizado para cada equipo.
+
+Incluye aspectos como:
+
+* materias primas utilizadas como variables explicativas;
+* coeficientes del modelo;
+* métricas de desempeño;
+* coeficiente de determinación (R²);
+* errores obtenidos durante la validación temporal.
+
+Permite que el agente no solo indique una predicción, sino que también pueda justificar la confiabilidad del modelo utilizado.
+
+---
+
+## 3. Consulta de datos históricos
+
+El agente puede recuperar precios históricos tanto de los equipos como de las materias primas.
+
+Cuando el usuario solicita intervalos extensos, la herramienta devuelve un resumen estadístico en lugar de todos los registros diarios. Esta decisión reduce el volumen de información procesada por el modelo, mejora la eficiencia de la conversación y evita consumir innecesariamente el contexto disponible del LLM.
+
+---
+
+## 4. Pronóstico de materias primas
+
+Además del precio proyectado de los equipos, el agente tiene acceso al pronóstico individual de las materias primas **Price_Y** y **Price_Z**, incluyendo sus intervalos de confianza.
+
+En esta solución también se entregan los pronósticos de las variables explicativas, permitiendo que el agente construya respuestas más interpretables, basadas en caidas o incrementos del precio en la materia prima.
+
+---
+
+## 5. Búsqueda web
+
+El agente dispone de una herramienta de búsqueda web para consultar información reciente relacionada con materias primas, mercados, eventos económicos o factores geopolíticos.
+
+Complementa la predicción cuantitativa con evidencia cualitativa proveniente de fuentes externas. Por ejemplo, si el modelo proyecta un incremento en una materia prima, el agente puede buscar noticias recientes sobre problemas de suministro, cambios en la demanda, conflictos internacionales o políticas económicas que ayuden a explicar dicho comportamiento.
+
+Esto permite distinguir claramente entre:
+
+* la predicción obtenida mediante modelos estadísticos; y
+* el contexto económico actual obtenido desde fuentes externas.
+
+Sin embargo, claramente para una busqueda real se tendrían que saber qué materias primas son Y y Z. 
+
+---
+
+# Beneficios de la arquitectura
+
+La combinación del pipeline de predicción con un agente basado en herramientas proporciona varias ventajas:
+
+* Separación entre entrenamiento, inferencia e interacción con el usuario.
+* Respuestas fundamentadas en datos reales y no generadas únicamente por el modelo de lenguaje.
+* Explicaciones interpretables apoyadas tanto en las variables predictoras como en el desempeño del modelo.
+* Integración de contexto económico actualizado mediante búsqueda web.
+* Arquitectura modular que facilita reemplazar modelos predictivos o incorporar nuevas herramientas sin modificar la lógica principal del agente.
+
+
+## 3. Arquitectura de despliegue (Azure)
+
+```mermaid
+flowchart LR
+    subgraph GitHub
+        A[Push a main] --> B[GitHub Actions:<br/>backend-deploy.yml]
+        A --> C[GitHub Actions:<br/>frontend-deploy.yml]
+    end
+
+    B -->|build imagen Docker| D[Azure Container Registry]
+    D -->|deploy| E[Azure App Service<br/>Linux, contenedor<br/>Backend FastAPI]
+
+    C -->|npm run build| F[Azure Static Web Apps<br/>Frontend React/Vite]
+
+    F -->|VITE_API_BASE_URL<br/>REST/HTTPS| E
+    E -->|tool calls| G[NVIDIA API<br/>DeepSeek-V4-Flash]
+    E -->|web_search tool| H[DuckDuckGo]
+```
+
+- **Backend → Azure App Service (Linux, contenedor).** Se despliega como
+  imagen Docker construida por `backend/Dockerfile`, publicada a un Azure
+  Container Registry y desplegada por App Service. Variables de entorno
+  (`NVIDIA_API_KEY`, `CORS_ORIGINS`, etc.) se configuran en Application Settings.
+- **Frontend → Azure Static Web Apps.** Se compila con Vite en el propio
+  workflow de GitHub Actions y se sube como sitio estático, con
+  `staticwebapp.config.json` manejando el fallback de rutas para React Router.
+- Ambos servicios se comunican por HTTPS/REST; el frontend nunca accede
+  directo a NVIDIA ni a los datos — todo pasa por el backend.
+
+---
+
+## 4. Cómo ejecutar el proyecto localmente
+
+El `.env` en la raíz y en `backend/` ya están configurados con las API keys
+reales.
 
 ```bash
-cp .env.example .env
-# edita .env y coloca tu NVIDIA_API_KEY real
-
-# Copia tus datos reales del notebook a backend/agent_data/
-# (ver backend/agent_data/README.md para el listado completo)
-cp /ruta/a/tu/agent_data/*.json backend/agent_data/
-cp /ruta/a/tu/historico_equipos.csv backend/agent_data/
-
 docker compose up --build
 ```
 
-- Backend: http://localhost:8000 (docs interactivos en `/docs`)
+- Backend: http://localhost:8000 — documentación interactiva (Swagger) en `/docs`
 - Frontend: http://localhost:5173
 
-## Ejecutar en local sin Docker
+**Verificado funcionando:**
+- ✅ Dashboard — carga resumen de modelos (coeficientes, R², métricas walk-forward)
+- ✅ Forecast — grafica pronóstico p5/mediana/p95 por equipo con Recharts
+- ✅ Chat — el agente responde usando sus tools (pronóstico, info de modelo,
+  histórico, búsqueda web) manteniendo memoria de conversación por sesión
 
-**Backend**
+Necesario: docker + docker compose.
 
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env  # completa NVIDIA_API_KEY
-uvicorn app.main:app --reload --port 8000
-```
+---
 
-**Frontend**
+## 5. Estado del despliegue en Azure
 
-```bash
-cd frontend
-npm install
-cp .env.example .env  # ajusta VITE_API_BASE_URL si es necesario
-npm run dev
-```
+Se completó la configuración de infraestructura como código para un
+despliegue productivo:
 
-## Endpoints principales
+- Repositorio en GitHub con los workflows `.github/workflows/backend-deploy.yml`
+  y `.github/workflows/frontend-deploy.yml` funcionales (build de imagen Docker,
+  push a ACR, build de Vite).
+- Recursos de Azure creados: Resource Group, Azure Container Registry, App
+  Service Plan (Linux), Web App para contenedores, y Static Web App para el
+  frontend.
+- Secrets de GitHub configurados (`AZURE_ACR_*`, `AZURE_BACKEND_APP_NAME`,
+  `AZURE_BACKEND_PUBLISH_PROFILE`, `AZURE_STATIC_WEB_APPS_API_TOKEN`,
+  `VITE_API_BASE_URL`).
 
-| Método | Ruta                                     | Descripción                                   |
-|--------|-------------------------------------------|------------------------------------------------|
-| POST   | `/api/v1/chat`                            | Envía un mensaje al agente (memoria por `thread_id`) |
-| GET    | `/api/v1/forecast/equipos`                | Lista los equipos disponibles                  |
-| GET    | `/api/v1/forecast/equipos/{equipo}`       | Pronóstico p5/mediana/p95 de un equipo         |
-| GET    | `/api/v1/forecast/materias-primas/{materia}` | Pronóstico ARIMA de una materia prima       |
-| GET    | `/api/v1/models`                          | Resumen (coeficientes, R², métricas) de todos los modelos |
-| GET    | `/api/v1/models/{equipo}`                 | Resumen de un modelo específico                |
-| GET    | `/api/v1/historico`                       | Histórico completo                             |
-| GET    | `/api/v1/historico/{serie}?fecha_inicio=&fecha_fin=` | Serie histórica en un rango         |
-| GET    | `/api/v1/health`                          | Health check                                   |
+**Bloqueo encontrado:** la suscripción de estudiante (Azure for Students) usada
+para las pruebas devolvió **`Status: Quota exceeded`** al intentar aprovisionar
+el App Service Plan necesario para correr el backend como contenedor — el plan
+gratuito/de estudiante tiene un límite de núcleos/recursos por región que la
+cuenta ya había alcanzado con otros recursos de prueba.
 
-## Despliegue en Azure
+Como evidencia de que la arquitectura de despliegue es funcional más allá de
+esta limitación de cuota:
+- El **build de la imagen Docker se completa exitosamente** en el workflow de
+  GitHub Actions (mismo Dockerfile validado localmente con `docker compose`).
+- El **frontend sí compiló y desplegó** en Azure Static Web Apps sin problemas
+  (no consume el mismo cupo de cómputo que App Service).
+- El error de cuota es reproducible y específico de Azure for Students, no del
+  código ni de la configuración del pipeline.
 
-### Backend → Azure App Service (contenedor)
+Ante un entorno con cuota disponible (suscripción Pay-As-You-Go o Enterprise),
+el mismo pipeline desplegaría el backend sin cambios adicionales.
 
-1. Crea un **Azure Container Registry (ACR)** y un **App Service (Linux, contenedor)**.
-2. Configura en GitHub → Settings → Secrets los siguientes valores:
-   - `AZURE_ACR_LOGIN_SERVER`, `AZURE_ACR_USERNAME`, `AZURE_ACR_PASSWORD`
-   - `AZURE_BACKEND_APP_NAME`
-   - `AZURE_BACKEND_PUBLISH_PROFILE` (descárgalo desde el portal de Azure → App Service → "Get publish profile")
-3. En App Service → Configuration → Application settings, agrega:
-   `NVIDIA_API_KEY`, `NVIDIA_MODEL`, `NVIDIA_BASE_URL`, `CORS_ORIGINS` (con la URL real del frontend).
-4. Cada push a `main` que toque `backend/**` dispara
-   `.github/workflows/backend-deploy.yml`, que construye la imagen, la sube a
-   ACR y la despliega.
+---
 
-### Frontend → Azure Static Web Apps
+## 6. Stack tecnológico
 
-1. Crea un recurso **Azure Static Web Apps** (plan gratuito o estándar).
-2. Copia el token de despliegue a un secret de GitHub:
-   `AZURE_STATIC_WEB_APPS_API_TOKEN`.
-3. Agrega el secret `VITE_API_BASE_URL` apuntando a la URL pública del
-   backend (ej. `https://mi-backend.azurewebsites.net/api/v1`).
-4. Cada push a `main` que toque `frontend/**` dispara
-   `.github/workflows/frontend-deploy.yml`.
+| Categoría | Herramienta |
+|---|---|
+| Backend framework | FastAPI, Uvicorn, Gunicorn |
+| Validación / tipado | Pydantic v2, Pydantic Settings |
+| Orquestación del agente | LangGraph (`create_react_agent`), memoria vía `MemorySaver` |
+| LLM | DeepSeek-V4-Flash, servido vía API de NVIDIA (compatible OpenAI, `langchain-openai`) |
+| Búsqueda web (tool del agente) | `duckduckgo-search` |
+| Frontend | React 18, Vite, React Router |
+| Gráficos | Recharts |
+| HTTP client | Axios (con interceptor centralizado de errores) |
+| Contenedores | Docker (multi-stage), Docker Compose |
+| Servidor estático frontend | nginx (imagen de producción) |
+| CI/CD | GitHub Actions |
+| Cloud | Azure App Service (backend), Azure Container Registry, Azure Static Web Apps (frontend) |
 
-> Alternativa: si prefieres desplegar el frontend también como contenedor en
-> App Service en vez de Static Web Apps, usa la imagen generada por
-> `frontend/Dockerfile` (nginx) igual que el backend.
+---
 
-## Variables de entorno
+## 7. Endpoints principales
 
-Ver `backend/.env.example` y `frontend/.env.example`.
+| Método | Ruta | Descripción |
+|---|---|---|
+| POST | `/api/v1/chat` | Mensaje al agente (memoria por `thread_id`) |
+| GET | `/api/v1/forecast/equipos` | Lista de equipos disponibles |
+| GET | `/api/v1/forecast/equipos/{equipo}` | Pronóstico p5/mediana/p95 |
+| GET | `/api/v1/forecast/materias-primas/{materia}` | Pronóstico ARIMA de materia prima |
+| GET | `/api/v1/models` / `/api/v1/models/{equipo}` | Coeficientes, R², métricas de validación |
+| GET | `/api/v1/historico` / `/api/v1/historico/{serie}` | Histórico real de precios |
+| GET | `/api/v1/health` | Health check |
 
-## Buenas prácticas aplicadas
+Documentación interactiva completa (OpenAPI/Swagger) disponible en `/docs`
+con el backend corriendo.
 
-- Tipado con Pydantic (backend) y props explícitas por componente (frontend).
-- Manejo centralizado de errores (`app/exceptions/handlers.py` en backend,
-  interceptor de Axios en frontend).
-- Separación estricta entre presentación (`api/`, `pages/`, `components/`),
-  lógica de negocio (`application/`) y acceso a datos (`infrastructure/`).
-- Sin credenciales hardcodeadas: todo vía variables de entorno.
-- Healthchecks en ambos contenedores para App Service / orquestadores.
+---
+
+## 8. Decisiones de diseño relevantes
+
+- **No se modificó la lógica de negocio del agente ni de los modelos de
+  pronóstico** (ARIMA + regresión + Monte Carlo del notebook).
+- **Manejo de errores centralizado** en ambos extremos: el backend traduce
+  excepciones de dominio (`EquipoNotFoundError`, `AgentExecutionError`, etc.)
+  a respuestas HTTP consistentes; el frontend normaliza cualquier error de
+  Axios antes de mostrarlo, con estados de carga/error uniformes en cada
+  pantalla.
+- **Sin credenciales explícitas**: toda configuración sensible vía variables
+  de entorno.
+- **Datos como volumen, no como parte de la imagen**: `agent_data/` se monta
+  como volumen en `docker-compose`, permitiendo actualizar los pronósticos sin
+  reconstruir la imagen — relevante porque estos JSON se regeneran cada vez
+  que se reentrena el modelo en el notebook.
+
+---
+
+## 9. Limitaciones conocidas / próximos pasos
+
+- El despliegue completo en Azure (backend en vivo) queda pendiente de una
+  suscripción sin restricción de cuota.
+
+- La velocidad del agente se puede mejorar cambiando a modelos de paga o limitando algunas funciones.

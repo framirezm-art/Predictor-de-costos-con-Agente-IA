@@ -237,7 +237,7 @@ def build_agent():
         temperature=0.3,
         max_tokens=1500,
         # extra_body es específico de NVIDIA/DeepSeek para el modo de razonamiento
-        extra_body={"chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}},
+        extra_body={"chat_template_kwargs": {"thinking": True, "reasoning_effort": "medium"}},
     )
 
     checkpointer = MemorySaver()  # memoria de la conversación entre turnos
